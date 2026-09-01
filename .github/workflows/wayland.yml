@@ -43,10 +43,14 @@ jobs:
         run: |
           set -xe
           BUILD_TYPE="${{ inputs.build_type || 'Release' }}"
-          # Mimics build.sh:build_desktop_target but with FILAMENT_SUPPORTS_WAYLAND=ON
-          # This disables X11 (CMakeLists.txt:215) and builds Vulkan+wayland_surface
+          # Use the clang version installed by linux-prereq (GITHUB_CLANG_VERSION=17)
+          # Do NOT hardcode /usr/bin/clang (which is 18 on ubuntu-24.04), use versioned binary
+          # linux-prereq sets cc/c++ alternatives, but we explicitly use versioned clang to avoid -lc++abi mismatch
+          echo "clang version: $(clang-${GITHUB_CLANG_VERSION} --version | head -1)"
+          echo "cmake version: $(cmake --version | head -1)"
+          ls /usr/lib/llvm-${GITHUB_CLANG_VERSION}/lib/ 2>&1 | grep -E "libc\+\+" | head
           mkdir -p out/cmake-wayland-release
-          CC=/usr/bin/clang CXX=/usr/bin/clang++ CXXFLAGS=-stdlib=libc++ \
+          CC=clang-${GITHUB_CLANG_VERSION} CXX=clang++-${GITHUB_CLANG_VERSION} CXXFLAGS=-stdlib=libc++ \
             cmake -G Ninja \
               -B out/cmake-wayland-release -S . \
               -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
