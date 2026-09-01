@@ -37,7 +37,12 @@ jobs:
       - name: Install Wayland prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwayland-dev libwayland-egl1 wayland-protocols libxkbcommon-dev libwayland-bin pkg-config
+          # linux-prereq already installed mesa-common-dev libxi-dev libxxf86vm-dev + clang-17
+          # Wayland needs + EGL headers (SDL_egl.c) + wayland stack
+          sudo apt-get install -y libwayland-dev libwayland-egl1 wayland-protocols libxkbcommon-dev libwayland-bin pkg-config libegl-dev libgles2-mesa-dev libglu1-mesa-dev
+          # verify EGL header present (release.yml never needs this because X11 path doesn't include SDL wayland)
+          ls /usr/include/EGL/egl.h && echo "EGL OK" || (echo "EGL missing"; exit 1)
+          pkg-config --modversion wayland-client wayland-egl xkbcommon || true
 
       - name: Build Wayland Release
         run: |
