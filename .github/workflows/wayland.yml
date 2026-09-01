@@ -1,0 +1,95 @@
+name: Wayland Release
+
+on:
+  push:
+    branches: [wayland]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (Release/Debug)'
+        required: false
+        default: 'Release'
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+
+jobs:
+  build-wayland-linux:
+    name: build-wayland-linux
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Decide Git ref (for release upload)
+        id: git_ref
+        run: |
+          REF=${GITHUB_REF}
+          TAG=${REF##*/}
+          echo "ref=${REF}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/linux-prereq
+
+      - name: Install Wayland prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libwayland-egl1 wayland-protocols libxkbcommon-dev libwayland-bin pkg-config
+
+      - name: Build Wayland Release
+        run: |
+          set -xe
+          BUILD_TYPE="${{ inputs.build_type || 'Release' }}"
+          # Mimics build.sh:build_desktop_target but with FILAMENT_SUPPORTS_WAYLAND=ON
+          # This disables X11 (CMakeLists.txt:215) and builds Vulkan+wayland_surface
+          mkdir -p out/cmake-wayland-release
+          CC=/usr/bin/clang CXX=/usr/bin/clang++ CXXFLAGS=-stdlib=libc++ \
+            cmake -G Ninja \
+              -B out/cmake-wayland-release -S . \
+              -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+              -DCMAKE_INSTALL_PREFIX=$(pwd)/out/wayland-release/filament \
+              -DFILAMENT_SUPPORTS_WAYLAND=ON \
+              -DFILAMENT_SUPPORTS_XCB=OFF \
+              -DFILAMENT_SUPPORTS_XLIB=OFF \
+              -DFILAMENT_SKIP_SDL2=OFF
+          ninja -C out/cmake-wayland-release -j$(nproc)
+          ninja -C out/cmake-wayland-release install
+          tar -czvf out/filament-wayland-release-linux.tgz -C out/wayland-release filament
+          ls -lh out/*.tgz
+          # Verify it's Wayland (should contain wayland_surface, no GLX)
+          grep -q "FILAMENT_SUPPORTS_WAYLAND:BOOL=ON" out/cmake-wayland-release/CMakeCache.txt && echo "Wayland enabled OK" || (echo "Wayland NOT enabled"; exit 1)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: filament-wayland-${{ steps.git_ref.outputs.tag }}-linux
+          path: out/filament-wayland-release-linux.tgz
+          retention-days: 30
+
+      # If this was triggered by a GitHub Release, upload as release asset (like release.yml does)
+      - name: Upload to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/filament-wayland-release-linux.tgz
+          tag_name: ${{ steps.git_ref.outputs.tag }}
+
+  # Optional: ARM64 cross-build (uncomment if you need aarch64 wayland)
+  # build-wayland-arm:
+  #   runs-on: arm-ubuntu-24.04-16core  # GitHub ARM runner
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: ./.github/actions/linux-prereq
+  #     - run: sudo apt-get install -y libwayland-dev wayland-protocols libxkbcommon-dev libwayland-bin
+  #     - run: |
+  #         mkdir -p out/cmake-wayland-release
+  #         CC=/usr/bin/clang CXX=/usr/bin/clang++ cmake -G Ninja -B out/cmake-wayland-release -S . -DCMAKE_BUILD_TYPE=Release -DFILAMENT_SUPPORTS_WAYLAND=ON -DCMAKE_INSTALL_PREFIX=$(pwd)/out/wayland-release/filament
+  #         ninja -C out/cmake-wayland-release -j$(nproc) && ninja -C out/cmake-wayland-release install
+  #         tar -czvf out/filament-wayland-release-arm-linux.tgz -C out/wayland-release filament
+  #     - uses: actions/upload-artifact@v4
+  #       with:
+  #         name: filament-wayland-arm-linux
+  #         path: out/filament-wayland-release-arm-linux.tgz
