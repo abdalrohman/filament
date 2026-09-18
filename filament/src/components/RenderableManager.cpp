@@ -264,16 +264,16 @@ RenderableManager::Builder& RenderableManager::Builder::skinning(size_t const bo
 }
 
 RenderableManager::Builder& RenderableManager::Builder::skinning(
-        size_t const boneCount, Bone const* bones) noexcept {
-    mImpl->mSkinningBoneCount = boneCount;
-    mImpl->mUserBones = bones;
+        Slice<const Bone> bones) noexcept {
+    mImpl->mSkinningBoneCount = bones.size();
+    mImpl->mUserBones = bones.data();
     return *this;
 }
 
 RenderableManager::Builder& RenderableManager::Builder::skinning(
-        size_t const boneCount, mat4f const* transforms) noexcept {
-    mImpl->mSkinningBoneCount = boneCount;
-    mImpl->mUserBoneMatrices = transforms;
+        Slice<const mat4f> transforms) noexcept {
+    mImpl->mSkinningBoneCount = transforms.size();
+    mImpl->mUserBoneMatrices = transforms.data();
     return *this;
 }
 
@@ -542,6 +542,17 @@ RenderableManager::Builder::Result RenderableManager::Builder::build(Engine& eng
         if (!entry.vertices) {
             continue;
         }
+
+        // an asynchronously built buffer only owns backend resources once its creation
+        // succeeded; recording one that is still creating, or whose creation was canceled, would
+        // bake handles to resources that were never generated into the render primitive.
+        FILAMENT_CHECK_PRECONDITION(entry.vertices->isCreationComplete())
+                << "[entity=" << entity.getId() << ", primitive @ " << i
+                << "] the VertexBuffer's creation is still in progress or was canceled";
+
+        FILAMENT_CHECK_PRECONDITION(!entry.indices || entry.indices->isCreationComplete())
+                << "[entity=" << entity.getId() << ", primitive @ " << i
+                << "] the IndexBuffer's creation is still in progress or was canceled";
 
         // we want a feature level violation to be a hard error (exception if enabled, or crash)
         int const activeFeatureLevel = static_cast<int>(engine.getActiveFeatureLevel());
@@ -999,6 +1010,13 @@ void FRenderableManager::setBones(Instance const ci,
         FILAMENT_CHECK_PRECONDITION(offset <= bones.count)
                 << "bone offset is out of bounds (" << offset << " > " << bones.count << ")";
 
+        FILAMENT_CHECK_PRECONDITION(boneCount == 0 || transforms != nullptr)
+                << "transforms cannot be null";
+
+        if (boneCount == 0) {
+            return;
+        }
+
         assert_invariant(bones.handle && offset + boneCount <= bones.count);
         if (bones.handle) {
             boneCount = std::min(boneCount, bones.count - offset);
@@ -1017,6 +1035,13 @@ void FRenderableManager::setBones(Instance const ci,
 
         FILAMENT_CHECK_PRECONDITION(offset <= bones.count)
                 << "bone offset is out of bounds (" << offset << " > " << bones.count << ")";
+
+        FILAMENT_CHECK_PRECONDITION(boneCount == 0 || transforms != nullptr)
+                << "transforms cannot be null";
+
+        if (boneCount == 0) {
+            return;
+        }
 
         assert_invariant(bones.handle && offset + boneCount <= bones.count);
         if (bones.handle) {
@@ -1072,6 +1097,13 @@ void FRenderableManager::setMorphWeights(Instance const instance, float const* w
         FILAMENT_CHECK_PRECONDITION(count + offset <= CONFIG_MAX_MORPH_TARGET_COUNT)
                 << "Only " << CONFIG_MAX_MORPH_TARGET_COUNT
                 << " morph targets are supported (count=" << count << ", offset=" << offset << ")";
+
+        FILAMENT_CHECK_PRECONDITION(count == 0 || weights != nullptr)
+                << "weights cannot be null";
+
+        if (count == 0) {
+            return;
+        }
 
         MorphWeights const& morphWeights = mManager[instance].morphWeights;
         if (morphWeights.handle) {

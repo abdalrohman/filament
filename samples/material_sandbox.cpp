@@ -17,9 +17,9 @@
 #include "material_sandbox.h"
 
 #include "common/arguments.h"
-#include "common/SampleConfig.h"
 
 #include <filamentapp/AssetLoader.h>
+#include <filamentapp/DesktopAssetLoader.h>
 #include <filamentapp/FilamentApp2.h>
 #include <filamentapp/IBL.h>
 #include <filamentapp/MeshAssimp.h>
@@ -51,6 +51,7 @@
 #include <math/vec4.h>
 
 #include <imgui.h>
+#include <samples/SampleConfig.h>
 
 #include <iostream>
 #include <map>
@@ -72,6 +73,7 @@ struct App {
 Scene* g_scene = nullptr;
 
 std::unique_ptr<MeshAssimp> g_meshSet;
+filament::app::AssetLoader* g_assetLoader = nullptr;
 std::map<utils::CString, MaterialInstance*> g_meshMaterialInstances;
 SandboxParameters g_params;
 ColorGradingOptions g_lastColorGradingOptions;
@@ -100,6 +102,7 @@ GroundPlane g_groundPlane;
 
 void cleanup(Engine* engine, View*, Scene*) {
     g_meshSet.reset(nullptr);
+    g_assetLoader = nullptr;
 
     if (g_groundPlane.renderable) {
         engine->destroy(g_groundPlane.renderable);
@@ -139,7 +142,7 @@ void cleanup(Engine* engine, View*, Scene*) {
 void setup(Engine* engine, View*, Scene* scene) {
     g_scene = scene;
 
-    g_meshSet = std::make_unique<MeshAssimp>(*engine);
+    g_meshSet = std::make_unique<MeshAssimp>(*engine, g_assetLoader);
 
     createInstances(g_params, *engine);
 
@@ -148,8 +151,7 @@ void setup(Engine* engine, View*, Scene* scene) {
         g_meshSet->addFromFile(filename, g_meshMaterialInstances);
     }
     if (g_config.positionalArgs.empty()) {
-        g_meshSet->addFromFile(FilamentApp2::getRootAssetsPath() +
-                                       "assets/models/material_sphere/material_sphere.obj",
+        g_meshSet->addFromFile("assets/models/material_sphere/material_sphere.obj",
                 g_meshMaterialInstances);
     }
 
@@ -998,6 +1000,7 @@ std::unique_ptr<FilamentApp2> createSampleApp(SampleConfig config,
         filament::app::DisplayManager* dm, filament::app::AssetLoader* loader) {
     auto app = std::make_shared<App>();
     g_config = config;
+    g_assetLoader = loader;
     g_shadowPlane = config.getBool("shadow-plane");
     g_singleMode = config.getBool("single-mode");
     config.dirt = config.getString("dirt");
@@ -1038,17 +1041,18 @@ int main(const int argc, char* argv[]) {
 
     samples::handleCommandLineArguments(argc, argv, &config, spec);
     auto dm = samples::getDisplayManager(config);
+    auto loader = samples::getAssetLoader(config);
 
     for (const auto& fname : config.positionalArgs) {
         Path filename(fname.c_str_safe());
-        if (!filename.exists()) {
+        if (!loader->exists(filename)) {
             std::cerr << "file " << filename << " not found!" << std::endl;
             return 1;
         }
     }
 
     config.title = "Material Sandbox";
-    auto fApp = createSampleApp(config, dm.get(), nullptr);
+    auto fApp = createSampleApp(config, dm.get(), loader.get());
     fApp->run();
     return 0;
 }

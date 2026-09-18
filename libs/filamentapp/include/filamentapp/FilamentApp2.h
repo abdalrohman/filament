@@ -18,7 +18,6 @@
 #define TNT_FILAMENT_SAMPLE_FILAMENTAPP2_H
 
 #include "AppEvent.h"
-#include "Config.h"
 #include "Cube.h"
 #include "Grid.h"
 #include "IBL.h"
@@ -31,9 +30,13 @@
 #include <utils/Entity.h>
 #include <utils/Path.h>
 
+#include <math/vec3.h>
+
+#include <atomic>
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
-#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -64,9 +67,10 @@ class WebGPUPlatform;
 namespace filament::app {
 class DisplayManager;
 class AssetLoader;
+class AssetWriter;
 } // namespace filament::app
 
-class FilamentApp2 {
+class UTILS_PUBLIC FilamentApp2 {
 public:
     using WebGPUBackend = filament::Engine::Backend;
     enum class DisplayManager { SDL, WEB };
@@ -85,6 +89,10 @@ public:
     using SurfaceCreatedCallback = std::function<void(filament::Engine*)>;
     using SurfaceDestroyedCallback = std::function<void(filament::Engine*)>;
 
+private:
+    static constexpr uint32_t MAX_WARMUP_FRAMES = std::numeric_limits<uint32_t>::max();
+
+public:
     class Builder {
     public:
         Builder() = default;
@@ -126,6 +134,22 @@ public:
             mCameraMode = cameraMode;
             return *this;
         }
+        /**
+         * Sets the initial eye and target position of the main camera, i.e. the home position of
+         * the camera manipulator. Defaults to an eye of (0, 0, 1) looking at (0, 0, -4).
+         *
+         * Samples that need to frame a specific scene must use this rather than calling
+         * Camera::lookAt() from their setup callback: the main camera is driven by the camera
+         * manipulator and is overwritten from it at the top of every frame.
+         *
+         * This only affects the orbit and map camera modes; free flight always starts from
+         * flightStartPosition.
+         */
+        Builder& cameraHome(filament::math::float3 eye, filament::math::float3 target) {
+            mCameraHomeEye = eye;
+            mCameraHomeTarget = target;
+            return *this;
+        }
         Builder& resizeable(bool resizeable) {
             mResizeable = resizeable;
             return *this;
@@ -158,6 +182,19 @@ public:
             mAsynchronousMode = asynchronousMode;
             return *this;
         }
+        Builder& screenshotPath(utils::CString const& screenshotPath) {
+            mScreenshotPath = screenshotPath;
+            return *this;
+        }
+        Builder& warmupFrames(int warmupFrames) {
+            mWarmupFrames = warmupFrames;
+            return *this;
+        }
+        Builder& fixedTimeStep(float fixedTimeStep) {
+            mFixedTimeStep = fixedTimeStep;
+            return *this;
+        }
+
         /**
          * Sets a custom AssetLoader for the application.
          *
@@ -166,6 +203,17 @@ public:
          */
         Builder& assetLoader(filament::app::AssetLoader* assetLoader) {
             mAssetLoader = assetLoader;
+            return *this;
+        }
+
+        /**
+         * Sets a custom AssetWriter for the application.
+         *
+         * @param assetWriter Pointer to an AssetWriter implementation.
+         *                    If nullptr or not set, the app will use a default DesktopAssetWriter.
+         */
+        Builder& assetWriter(filament::app::AssetWriter* assetWriter) {
+            mAssetWriter = assetWriter;
             return *this;
         }
 
@@ -305,6 +353,10 @@ public:
         filament::Engine::Backend mBackend = filament::Engine::Backend::DEFAULT;
         filament::backend::FeatureLevel mFeatureLevel = filament::backend::FeatureLevel::FEATURE_LEVEL_3;
         filament::camutils::Mode mCameraMode = filament::camutils::Mode::ORBIT;
+        // These defaults match what the orbit manipulator resolves an unset home position to, so
+        // that samples which never call cameraHome() keep their existing framing.
+        filament::math::float3 mCameraHomeEye = { 0.0f, 0.0f, 1.0f };
+        filament::math::float3 mCameraHomeTarget = { 0.0f, 0.0f, -4.0f };
         bool mResizeable = true;
         bool mHeadless = false;
         int mStereoscopicEyeCount = 2;
@@ -313,8 +365,12 @@ public:
         WebGPUBackend mForcedWebGPUBackend = WebGPUBackend::DEFAULT;
         DisplayManager mDisplayManagerConfig = DisplayManager::SDL;
         filament::backend::AsynchronousMode mAsynchronousMode = filament::backend::AsynchronousMode::NONE;
+        utils::CString mScreenshotPath;
+        uint32_t mWarmupFrames = MAX_WARMUP_FRAMES;
+        float mFixedTimeStep = 0.0f;
         filament::app::DisplayManager* mDisplayManager = nullptr;
         filament::app::AssetLoader* mAssetLoader = nullptr;
+        filament::app::AssetWriter* mAssetWriter = nullptr;
         SetupCallback mSetup;
         CleanupCallback mCleanup;
         PreRenderCallback mPreRender;
@@ -354,6 +410,7 @@ public:
 
     filament::app::DisplayManager* getDisplayManager() const noexcept { return mDisplayManager; }
     filament::app::AssetLoader* getAssetLoader() const noexcept { return mAssetLoader; }
+    filament::app::AssetWriter* getAssetWriter() const noexcept { return mAssetWriter; }
 
     void setSidebarWidth(int width) {
         mCameraParams.sidebarWidth = width;
@@ -389,15 +446,6 @@ public:
     FilamentApp2(FilamentApp2&& rhs) = delete;
     FilamentApp2& operator=(const FilamentApp2& rhs) = delete;
     FilamentApp2& operator=(FilamentApp2&& rhs) = delete;
-
-    /**
-     * Returns the path to the Filament root for loading assets. This is determined from the
-     * executable folder, which allows users to launch samples from any folder.
-     *
-     * This takes into account multi-configuration CMake generators, like Visual Studio or Xcode,
-     * that have different executable paths compared to single-configuration generators, like Ninja.
-     */
-    static const utils::Path& getRootAssetsPath();
 
 private:
     using CameraManipulator = filament::camutils::Manipulator<float>;
@@ -477,12 +525,16 @@ private:
     void configureCamerasForWindow(WindowCameraParams const& camera);
     void fixupMouseCoordinatesForHdpi(ssize_t& x, ssize_t& y) const;
 
+    void captureScreenshot(utils::CString const& filepath);
+
     bool mInitialized = false;
     filament::Engine* mEngine = nullptr;
     filament::Scene* mScene = nullptr;
     std::unique_ptr<IBL> mIBL;
     filament::Texture* mDirt = nullptr;
-    bool mClosed = false;
+    // Atomic because close() can be called from asynchronous driver/readback callbacks while
+    // the main loop reads mClosed in doFrame().
+    std::atomic<bool> mClosed{ false };
     double mTime = 0;
 
     filament::Material const* mDefaultMaterial = nullptr;
@@ -508,6 +560,8 @@ private:
     filament::app::DisplayManager* const mDisplayManager;
     std::unique_ptr<filament::app::AssetLoader> mDefaultAssetLoader;
     filament::app::AssetLoader* const mAssetLoader;
+    std::unique_ptr<filament::app::AssetWriter> mDefaultAssetWriter;
+    filament::app::AssetWriter* const mAssetWriter;
 
     filament::backend::Platform* mVulkanPlatform = nullptr;
     filament::backend::Platform* mWebGPUPlatform = nullptr;
@@ -549,6 +603,8 @@ private:
     filament::Engine::Backend mBackend = filament::Engine::Backend::DEFAULT;
     filament::backend::FeatureLevel mFeatureLevel = filament::backend::FeatureLevel::FEATURE_LEVEL_3;
     filament::camutils::Mode const mCameraMode;
+    filament::math::float3 const mCameraHomeEye;
+    filament::math::float3 const mCameraHomeTarget;
     bool const mResizeable = true;
     bool const mHeadless = false;
     int const mStereoscopicEyeCount = 2;
@@ -562,6 +618,12 @@ private:
     PostRenderCallback const mPostRender{};
     bool mMousePressed[3] = { false };
     bool mIsSplitView = false;
+
+    utils::CString const mScreenshotPath;
+    uint32_t mWarmupFrames = MAX_WARMUP_FRAMES;
+    float const mFixedTimeStep = 0.0f;
+    uint32_t mCurrentFrame = 0;
+    double mLastDisplayManagerTime = 0.0;
 
     std::unique_ptr<Cube> mCameraCube;
     std::unique_ptr<Grid> mCameraGrid;

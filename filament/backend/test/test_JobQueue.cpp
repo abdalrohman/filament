@@ -27,6 +27,32 @@
 
 using namespace filament::backend;
 
+namespace {
+
+// Mimics what a canceled or dropped job captures in practice: something whose destructor runs user
+// code that calls back into the queue (e.g. a BufferDescriptor whose release callback chains the
+// next asynchronous call). Destroying the job while the queue's lock is held deadlocks.
+struct ReentrantOnDestroy {
+    ReentrantOnDestroy(JobQueue::Ptr queue, std::atomic<JobQueue::JobId>* reentrantJobId)
+        : queue(std::move(queue)), reentrantJobId(reentrantJobId) {}
+
+    ReentrantOnDestroy(ReentrantOnDestroy&& rhs) noexcept
+        : queue(std::move(rhs.queue)), reentrantJobId(rhs.reentrantJobId) {
+        rhs.reentrantJobId = nullptr;
+    }
+
+    ~ReentrantOnDestroy() {
+        if (reentrantJobId) {
+            reentrantJobId->store(queue->issueJobId());
+        }
+    }
+
+    JobQueue::Ptr queue;
+    std::atomic<JobQueue::JobId>* reentrantJobId;
+};
+
+} // namespace
+
 TEST(JobQueue, PushAndPop) {
     JobQueue::Ptr queue = JobQueue::create();
     int v = 0;
@@ -106,15 +132,6 @@ TEST(JobQueue, CancelInvalid) {
 TEST(JobQueue, CancelDestroysJobWithoutHoldingLock) {
     JobQueue::Ptr queue = JobQueue::create();
 
-    // Mimics what a canceled job captures in practice: something whose destructor runs user code
-    // that calls back into the queue (e.g. a BufferDescriptor whose release callback chains the
-    // next asynchronous call). Destroying the job while the queue's lock is held deadlocks.
-    struct ReentrantOnDestroy {
-        JobQueue::Ptr queue;
-        std::atomic<JobQueue::JobId>* reentrantJobId;
-        ~ReentrantOnDestroy() { reentrantJobId->store(queue->issueJobId()); }
-    };
-
     std::atomic<JobQueue::JobId> reentrantJobId = { JobQueue::InvalidJobId };
     JobQueue::JobId const idToCancel = queue->push(
             [guard = std::make_unique<ReentrantOnDestroy>(
@@ -137,6 +154,9 @@ TEST(JobQueue, CancelDestroysJobWithoutHoldingLock) {
 
     // The job's destructor must have been able to use the queue.
     EXPECT_NE(JobQueue::InvalidJobId, reentrantJobId.load());
+
+    // The id it issued is a reservation, so release it.
+    EXPECT_TRUE(queue->cancel(reentrantJobId.load()));
 }
 
 TEST(JobQueue, Stop) {
@@ -157,11 +177,82 @@ TEST(JobQueue, Stop) {
     EXPECT_FALSE(job);
 }
 
+TEST(JobQueue, PushAfterStopReleasesPreIssuedJobId) {
+    JobQueue::Ptr queue = JobQueue::create();
+    JobQueue::JobId const preIssuedId = queue->issueJobId();
+    queue->stop();
+
+    EXPECT_EQ(JobQueue::InvalidJobId, queue->push([]() {}, preIssuedId));
+
+    // The reservation went with the job: there is nothing left to cancel.
+    EXPECT_FALSE(queue->cancel(preIssuedId));
+}
+
+TEST(JobQueue, PushAfterStopDestroysJobWithoutHoldingLock) {
+    JobQueue::Ptr queue = JobQueue::create();
+    queue->stop();
+
+    std::atomic<JobQueue::JobId> reentrantJobId = { JobQueue::InvalidJobId };
+
+    // Push from another thread so that a regression fails the test instead of hanging it.
+    auto pushed = std::make_shared<std::promise<JobQueue::JobId>>();
+    std::future<JobQueue::JobId> future = pushed->get_future();
+    std::thread pusher([queue, &reentrantJobId, pushed]() {
+        pushed->set_value(queue->push(
+                [guard = std::make_unique<ReentrantOnDestroy>(
+                         ReentrantOnDestroy{ queue, &reentrantJobId })]() {}));
+    });
+
+    if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        pusher.detach(); // the thread is stuck holding the queue's lock, it can't be joined
+        FAIL() << "push() deadlocked: the dropped job was destroyed while holding the queue's lock";
+    }
+
+    EXPECT_EQ(JobQueue::InvalidJobId, future.get());
+    pusher.join();
+
+    // The dropped job's destructor must have been able to use the queue.
+    EXPECT_NE(JobQueue::InvalidJobId, reentrantJobId.load());
+    EXPECT_TRUE(queue->cancel(reentrantJobId.load()));
+}
+
 TEST(JobQueue, PreIssuedJobId) {
     JobQueue::Ptr queue = JobQueue::create();
     JobQueue::JobId preIssuedId = queue->issueJobId();
     JobQueue::JobId id = queue->push([]() {}, preIssuedId);
     EXPECT_EQ(id, preIssuedId);
+}
+
+TEST(JobQueue, IssuedJobIdsAreReleasedByPushAndCancel) {
+    JobQueue::Ptr queue = JobQueue::create();
+    JobQueue::JobId const pushedId = queue->issueJobId();
+    JobQueue::JobId const canceledId = queue->issueJobId();
+
+    EXPECT_EQ(pushedId, queue->push([]() {}, pushedId));
+    EXPECT_TRUE(queue->cancel(canceledId));
+
+    // Both reservations are released. One holds a job now, the other is gone. So destroying the
+    // queue here must not abort.
+}
+
+// An id handed out by `issueJobId()` reserves a slot that only `push()` or `cancel()` releases.
+// When neither happens (i.e., an `...AsyncS()` whose `...AsyncR()` never pushes), the slot is never
+// reclaimed, and debug builds catch that when the queue is destroyed.
+TEST(JobQueueDeathTest, DestroyWithReservedJobIdAborts) {
+#ifdef NDEBUG
+    GTEST_SKIP() << "assert_invariant is compiled out of release builds";
+#else
+    // See ThreadWorkerDeathTest.DestroyWithoutTerminateAborts for why the style is changed.
+    std::string const previousStyle = GTEST_FLAG_GET(death_test_style);
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+
+    EXPECT_DEATH({
+        JobQueue::Ptr queue = JobQueue::create();
+        (void) queue->issueJobId();
+    }, "failed assertion");
+
+    GTEST_FLAG_SET(death_test_style, previousStyle);
+#endif
 }
 
 TEST(JobQueue, MultipleProducersConsumers) {

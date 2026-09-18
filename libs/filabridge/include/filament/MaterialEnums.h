@@ -21,6 +21,7 @@
 
 #include <utils/BitmaskEnum.h>
 #include <utils/bitset.h>
+#include <utils/compiler.h>
 
 #include <string_view>
 
@@ -30,7 +31,7 @@
 namespace filament {
 
 // update this when a new version of filament wouldn't work with older materials
-static constexpr size_t MATERIAL_VERSION = 75;
+static constexpr size_t MATERIAL_VERSION = 76;
 
 // Those are the api levels that are used in the source material file (.mat)
 //
@@ -251,7 +252,7 @@ enum class ReflectionMode : uint8_t {
 // can't really use std::underlying_type<AttributeIndex>::type because the driver takes a uint32_t
 using AttributeBitset = utils::bitset32;
 
-static constexpr size_t MATERIAL_PROPERTIES_COUNT = 34;
+static constexpr size_t MATERIAL_PROPERTIES_COUNT = 37;
 enum class Property : uint8_t {
     BASE_COLOR,               //!< float4, all shading models
     ROUGHNESS,                //!< float,  lit shading models only
@@ -287,13 +288,16 @@ enum class Property : uint8_t {
     CLIP_SPACE_POSITION,      //!< float4, vertex shader only
     SECOND_ROUGHNESS,         //!< float,  lit shading models only, except subsurface and cloth
     SECOND_ROUGHNESS_WEIGHT,  //!< float,  lit shading models only, except subsurface and cloth
+    IRIDESCENCE,              //!< float,  lit shading models only, except cloth
+    IRIDESCENCE_IOR,          //!< float,  lit shading models only, except cloth
+    IRIDESCENCE_THICKNESS,    //!< float,  lit shading models only, except cloth
 
     // when adding new Properties, make sure to update MATERIAL_PROPERTIES_COUNT
 };
 
 using UserVariantFilterMask = uint32_t;
 
-enum class UserVariantFilterBit : UserVariantFilterMask {
+enum class UTILS_APIGEN_FLAGS UserVariantFilterBit : UserVariantFilterMask {
     DIRECTIONAL_LIGHTING = 0x01, //!< Directional lighting
 
     //!< \note Since dynamic lighting was migrated to specialization constants, filtering this bit

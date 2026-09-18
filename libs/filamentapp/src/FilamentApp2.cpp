@@ -23,8 +23,14 @@
 
 #include "generated/resources/filamentapp.h"
 
+#include <imageio-lite/ImageEncoder.h>
+
+#include <image/ColorTransform.h>
+#include <image/LinearImage.h>
+
 #include <filamentapp/Config.h>
 #include <filamentapp/DesktopAssetLoader.h>
+#include <filamentapp/DesktopAssetWriter.h>
 #include <filamentapp/DisplayManager.h>
 #include <filamentapp/FilamentApp2.h>
 
@@ -41,6 +47,7 @@
 #include <filament/SwapChain.h>
 #include <filament/View.h>
 
+#include <backend/PixelBufferDescriptor.h>
 #include <backend/Platform.h>
 #if defined(FILAMENT_DRIVER_SUPPORTS_VULKAN)
 #include <backend/platforms/VulkanPlatform.h>
@@ -58,8 +65,10 @@
 #ifdef __EXCEPTIONS
 #include <exception>
 #endif
+#include <fstream>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -90,6 +99,8 @@ FilamentApp2::FilamentApp2(const Builder& builder)
           mBackend(builder.mBackend),
           mFeatureLevel(builder.mFeatureLevel),
           mCameraMode(builder.mCameraMode),
+          mCameraHomeEye(builder.mCameraHomeEye),
+          mCameraHomeTarget(builder.mCameraHomeTarget),
           mResizeable(builder.mResizeable),
           mHeadless(builder.mHeadless),
           mStereoscopicEyeCount(builder.mStereoscopicEyeCount),
@@ -97,9 +108,13 @@ FilamentApp2::FilamentApp2(const Builder& builder)
           mForcedWebGPUBackend(builder.mForcedWebGPUBackend),
           mAsynchronousMode(builder.mAsynchronousMode),
           mDisplayManager(builder.mDisplayManager),
-          mDefaultAssetLoader(
-                  builder.mAssetLoader ? nullptr : std::make_unique<DesktopAssetLoader>()),
+          mDefaultAssetLoader(builder.mAssetLoader
+                                      ? nullptr
+                                      : std::make_unique<filament::app::DesktopAssetLoader>()),
           mAssetLoader(builder.mAssetLoader ? builder.mAssetLoader : mDefaultAssetLoader.get()),
+          mDefaultAssetWriter(
+                  builder.mAssetWriter ? nullptr : std::make_unique<DesktopAssetWriter>()),
+          mAssetWriter(builder.mAssetWriter ? builder.mAssetWriter : mDefaultAssetWriter.get()),
           mSetupCallback(builder.mSetup),
           mCleanupCallback(builder.mCleanup),
           mPreRender(builder.mPreRender),
@@ -110,6 +125,9 @@ FilamentApp2::FilamentApp2(const Builder& builder)
           mDropHandler(builder.mDropHandler),
           mSurfaceCreatedCallback(builder.mSurfaceCreatedCallback),
           mSurfaceDestroyedCallback(builder.mSurfaceDestroyedCallback),
+          mScreenshotPath(builder.mScreenshotPath),
+          mWarmupFrames(builder.mWarmupFrames),
+          mFixedTimeStep(builder.mFixedTimeStep),
           mWidth(builder.mWidth),
           mHeight(builder.mHeight) {}
 
@@ -156,10 +174,6 @@ void FilamentApp2::init() {
                       .config(&engineConfig)
                       .build();
 
-    assert_invariant(mEngine->getBackend() == backend);
-
-    mBackend = backend;
-
     mWidth = mInitialWindowWidth;
     mHeight = mInitialWindowHeight;
 
@@ -190,12 +204,15 @@ void FilamentApp2::init() {
     mViews.emplace_back(mUiView = new CView(*mRenderer, "UI View"));
 
     // set-up the camera manipulators
-    mMainCameraMan =
-            CameraManipulator::Builder().targetPosition(0, 0, -4).flightMoveDamping(15.0).build(
-                    mCameraMode);
-    mDebugCameraMan =
-            CameraManipulator::Builder().targetPosition(0, 0, -4).flightMoveDamping(15.0).build(
-                    mCameraMode);
+    auto buildManipulator = [this]() {
+        return CameraManipulator::Builder()
+                .targetPosition(mCameraHomeTarget.x, mCameraHomeTarget.y, mCameraHomeTarget.z)
+                .orbitHomePosition(mCameraHomeEye.x, mCameraHomeEye.y, mCameraHomeEye.z)
+                .flightMoveDamping(15.0)
+                .build(mCameraMode);
+    };
+    mMainCameraMan = buildManipulator();
+    mDebugCameraMan = buildManipulator();
 
     mMainView->setCamera(mMainCamera);
     mMainView->setCameraManipulator(mMainCameraMan);
@@ -213,7 +230,14 @@ void FilamentApp2::init() {
     // configure the cameras
     configureCamerasForWindow(mCameraParams);
 
-    mMainCamera->lookAt({ 4, 0, -4 }, { 0, 0, -4 }, { 0, 1, 0 });
+    // Seed the camera from the manipulator's home position. This is overwritten from the
+    // manipulator again at the top of every frame (see doFrame), so it only matters to code that
+    // inspects the camera before the first frame is drawn.
+    {
+        filament::math::float3 eye, center, up;
+        mMainCameraMan->getLookAt(&eye, &center, &up);
+        mMainCamera->lookAt(eye, center, up);
+    }
 
     mDepthMaterial =
             Material::Builder()
@@ -284,20 +308,20 @@ void FilamentApp2::init() {
 
     if (mImguiCallback) {
         mAppGui = std::make_unique<FilamentAppGui>(mEngine, mUiView->getView(),
-                getRootAssetsPath() + "assets/fonts/Roboto-Medium.ttf");
+                mAssetLoader->resolve("assets/fonts/Roboto-Medium.ttf"));
     }
+
+    mWindow = mDisplayManager->createWindow(mWindowTitle.c_str(), mInitialWindowWidth,
+            mInitialWindowHeight, mResizeable, mHeadless);
+
+    onSurfaceCreated();
+    onSurfaceChanged((int) mInitialWindowWidth, (int) mInitialWindowHeight);
 
     mInitialized = true;
 }
 
 void FilamentApp2::run() {
     init();
-
-    mWindow = mDisplayManager->createWindow(mWindowTitle.c_str(), mInitialWindowWidth, mInitialWindowHeight,
-            mResizeable, mHeadless);
-
-    onSurfaceCreated();
-    onSurfaceChanged((int) mInitialWindowWidth, (int) mInitialWindowHeight);
 
     while (!doFrame()) {
         // Paces the loop to roughly display refresh rate so an interactive app doesn't spin a
@@ -316,10 +340,6 @@ void FilamentApp2::run() {
 }
 
 void FilamentApp2::onSurfaceCreated() {
-    if (!mInitialized) {
-        init();
-    }
-
     void* nativeWindow = mDisplayManager ? mDisplayManager->getNativeWindow(mWindow) : nullptr;
 
     if (mSwapChain) {
@@ -371,6 +391,66 @@ void FilamentApp2::onSurfaceDestroyed() {
     }
 }
 
+void FilamentApp2::captureScreenshot(utils::CString const& filepath) {
+    if (mViews.empty() || !mViews[0] || !mRenderer) {
+        return;
+    }
+    View* view = mViews[0]->getView();
+    if (!view) {
+        return;
+    }
+    filament::Viewport const& vp = view->getViewport();
+    size_t const byteCount = size_t(vp.width) * size_t(vp.height) * 4;
+
+    struct ScreenshotState {
+        View* view = nullptr;
+        utils::CString filename;
+        FilamentApp2* app = nullptr;
+    };
+
+    backend::PixelBufferDescriptor buffer(
+            new uint8_t[byteCount], byteCount,
+            backend::PixelBufferDescriptor::PixelDataFormat::RGBA,
+            backend::PixelBufferDescriptor::PixelDataType::UBYTE,
+            [](void* buffer, size_t, void* user) {
+                std::unique_ptr<ScreenshotState> state(static_cast<ScreenshotState*>(user));
+                uint8_t* pixels = static_cast<uint8_t*>(buffer);
+                if (!state || !state->app) {
+                    delete[] pixels;
+                    return;
+                }
+
+                const filament::Viewport& vp = state->view->getViewport();
+                image::LinearImage image = image::toLinearWithAlpha<uint8_t>(
+                        vp.width, vp.height, vp.width * 4, pixels, [](uint8_t v) { return v; },
+                        image::sRGBToLinear<filament::math::float4>);
+
+                std::ostringstream ss(std::ios::binary);
+                bool const encoded = imageio_lite::ImageEncoder::encode(ss,
+                        imageio_lite::ImageEncoder::Format::TIFF, image, "", "");
+
+                if (encoded) {
+                    std::string const data = ss.str();
+                    utils::Path out(state->filename.c_str_safe());
+                    if (!state->app->getAssetWriter()->write(out,
+                                reinterpret_cast<const uint8_t*>(data.data()), data.size())) {
+                        utils::slog.e << "Failed to write screenshot output file: "
+                                      << state->filename.c_str_safe() << utils::io::endl;
+                    }
+                } else {
+                    utils::slog.e << "Failed to encode screenshot TIFF for: "
+                                  << state->filename.c_str_safe() << utils::io::endl;
+                }
+
+                delete[] pixels;
+                state->app->close();
+            },
+            new ScreenshotState{ view, filepath, this });
+
+    mRenderer->readPixels((uint32_t) vp.left, (uint32_t) vp.bottom, vp.width, vp.height,
+            std::move(buffer));
+}
+
 View* FilamentApp2::getGuiView() const noexcept { return mAppGui ? mAppGui->getView() : nullptr; }
 
 bool FilamentApp2::doFrame() {
@@ -390,10 +470,28 @@ bool FilamentApp2::doFrame() {
             mEngine->execute();
         }
 
+        float timeStep = 1.0f / 60.0f;
+        double currentTime = 0.0;
+
+        // If we're in an instrumented mode (e.g. for testing), then the timestamp used in animation
+        // is not "real" time but virtualized. The following accounts for that.
+        bool const isFixedTime = mFixedTimeStep > 0.0f;
+        if (!isFixedTime) {
+            if (mDisplayManager) {
+                currentTime = mDisplayManager->getTime();
+                if (mLastDisplayManagerTime > 0.0) {
+                    timeStep = float(currentTime - mLastDisplayManagerTime);
+                }
+                mLastDisplayManagerTime = currentTime;
+            }
+        } else {
+            currentTime = double(mCurrentFrame + 1) * double(mFixedTimeStep);
+            timeStep = mFixedTimeStep;
+        }
+
         // Allow the app to animate the scene if desired.
         if (mAnimation) {
-            double time = mDisplayManager ? mDisplayManager->getTime() : 0.0;
-            mAnimation(mEngine, mMainView->getView(), time);
+            mAnimation(mEngine, mMainView->getView(), currentTime);
         }
 
         // Loop over fresh events twice: first stash them and let ImGui process them, then allow
@@ -475,12 +573,6 @@ bool FilamentApp2::doFrame() {
             shutdown();
             return true;
         }
-
-        // Calculate the time step.
-        static double lastTime = 0;
-        double now = mDisplayManager ? mDisplayManager->getTime() : 0.0;
-        const float timeStep = lastTime > 0 ? (float) (now - lastTime) : (float) (1.0f / 60.0f);
-        lastTime = now;
 
         // Populate the UI scene, regardless of whether Filament wants to a skip frame. We should
         // always let ImGui generate a command list; if it skips a frame it'll destroy its widgets.
@@ -616,7 +708,16 @@ bool FilamentApp2::doFrame() {
             if (mPostRender) {
                 mPostRender(mEngine, mViews[0]->getView(), mScene, mRenderer);
             }
+
+            if (!mScreenshotPath.empty() && mCurrentFrame >= mWarmupFrames) {
+                captureScreenshot(mScreenshotPath);
+
+                // Ensures we only take one screenshot.
+                mWarmupFrames = MAX_WARMUP_FRAMES;
+            }
+
             mRenderer->endFrame();
+            mCurrentFrame++;
         } else {
             ++mSkippedFrames;
         }
@@ -701,38 +802,18 @@ void FilamentApp2::shutdown() {
     mInitialized = false;
 }
 
-// RELATIVE_ASSET_PATH is set inside samples/CMakeLists.txt and used to support multi-configuration
-// generators, like Visual Studio or Xcode.
-#ifndef RELATIVE_ASSET_PATH
-#define RELATIVE_ASSET_PATH "."
-#endif
-
-const utils::Path& FilamentApp2::getRootAssetsPath() {
-    static const utils::Path root =
-            utils::Path::getCurrentExecutable().getParent() + RELATIVE_ASSET_PATH;
-    return root;
-}
-
 void FilamentApp2::loadIBL(std::string_view path) {
     Path iblPath(path);
-    if (!iblPath.exists()) {
-        std::cerr << "The specified IBL path does not exist: " << iblPath << std::endl;
-        return;
-    }
 
     // Note that IBL holds a skybox, and Scene also holds a reference.  We cannot release IBL's
     // skybox until after new skybox has been set in the scene.
     std::unique_ptr<IBL> oldIBL = std::move(mIBL);
-    mIBL = std::make_unique<IBL>(*mEngine);
+    mIBL = std::make_unique<IBL>(*mEngine, mAssetLoader);
 
-    if (!iblPath.isDirectory()) {
+    // We can't use isDirectory() on Android assets since they don't map to filesystem
+    // Try directory first, then equirect
+    if (!mIBL->loadFromDirectory(iblPath)) {
         if (!mIBL->loadFromEquirect(iblPath)) {
-            std::cerr << "Could not load the specified IBL: " << iblPath << std::endl;
-            mIBL.reset(nullptr);
-            return;
-        }
-    } else {
-        if (!mIBL->loadFromDirectory(iblPath)) {
             std::cerr << "Could not load the specified IBL: " << iblPath << std::endl;
             mIBL.reset(nullptr);
             return;
@@ -757,19 +838,17 @@ void FilamentApp2::loadDirt() {
     if (!mDirtPath.empty()) {
         Path dirtPath(mDirtPath);
 
-        if (!dirtPath.exists()) {
-            std::cerr << "The specified dirt file does not exist: " << dirtPath << std::endl;
-            return;
-        }
-
-        if (!dirtPath.isFile()) {
-            std::cerr << "The specified dirt path is not a file: " << dirtPath << std::endl;
-            return;
-        }
-
         int w, h, n;
+        unsigned char* data = nullptr;
 
-        unsigned char* data = stbi_load(dirtPath.getAbsolutePath().c_str(), &w, &h, &n, 3);
+        auto buf = mAssetLoader->load(dirtPath);
+        if (!buf.empty()) {
+            data = stbi_load_from_memory(buf.data(), buf.size(), &w, &h, &n, 3);
+        }
+
+        if (!data) {
+            return;
+        }
         assert(n == 3);
 
         mDirt = Texture::Builder()
