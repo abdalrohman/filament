@@ -70,10 +70,49 @@ def validate_tolerance(tolerance):
 
 _MODEL_SCAN_CACHE = {}
 
+# glTF-Sample-Assets ships several variants of a model under the same file name, e.g.
+# Models/Duck/{glTF,glTF-Binary,glTF-Embedded,glTF-Draco,glTF-Quantized}/Duck.{gltf,glb}.
+# Only glTF-Binary, and failing that glTF, is accepted. The other variants encode the data
+# differently (quantized, Draco, meshopt, ...) and can render differently, so silently falling
+# back to one of them would make a golden depend on which variants happen to be present.
+_PREFERRED_VARIANT_DIRS = ('glTF-Binary', 'glTF')
+_VARIANT_DIR_PREFIX = 'glTF'
+
+
+def _select_model_file(name, files):
+  """
+  Picks the file to use among all files that share a model name within one search path.
+
+  The choice must not depend on the filesystem: glob returns entries in directory order, which
+  differs between runner images. Letting that order decide once swapped Duck to its
+  glTF-Quantized variant and broke the WebGPU golden.
+  """
+  def variant(model_file):
+    return path.basename(path.dirname(model_file))
+
+  for preferred in _PREFERRED_VARIANT_DIRS:
+    matches = [f for f in files if variant(f) == preferred]
+    if len(matches) == 1:
+      return matches[0]
+    if len(matches) > 1:
+      break
+
+  # A single file outside a variant layout, e.g. third_party/models/lucy/lucy.glb.
+  if len(files) == 1 and not variant(files[0]).startswith(_VARIANT_DIR_PREFIX):
+    return files[0]
+
+  candidates = '\n  '.join(sorted(files))
+  raise ValueError(f"Cannot choose a file for model '{name}': expected exactly one file in a "
+                   f"{' or '.join(_PREFERRED_VARIANT_DIRS)} directory. Candidates:\n  {candidates}")
+
+
 def scan_models(search_paths, base_dir=None):
   """
   Recursively scan for .glb and .gltf files across search_paths.
-  Results are cached by the set of resolved search paths.
+  Results are cached by the ordered list of resolved search paths.
+
+  When a model name appears in several search paths, the last search path wins. Within a single
+  search path, the file is chosen by _select_model_file, which raises if the choice is ambiguous.
   """
   resolved_paths = []
   for p in search_paths:
@@ -87,7 +126,8 @@ def scan_models(search_paths, base_dir=None):
     else:
       resolved_paths.append(path.abspath(p))
 
-  cache_key = tuple(sorted(set(resolved_paths)))
+  # Order matters, because a later search path overrides an earlier one.
+  cache_key = tuple(resolved_paths)
   if cache_key in _MODEL_SCAN_CACHE:
     return _MODEL_SCAN_CACHE[cache_key]
 
@@ -97,9 +137,12 @@ def scan_models(search_paths, base_dir=None):
       continue
     glb_files = glob.glob(f'{d}/**/*.glb', recursive=True)
     gltf_files = glob.glob(f'{d}/**/*.gltf', recursive=True)
+    candidates = {}
     for model_file in chain(glb_files, gltf_files):
       name = path.splitext(path.basename(model_file))[0]
-      models[name] = path.abspath(model_file)
+      candidates.setdefault(name, []).append(path.abspath(model_file))
+    for name, files in candidates.items():
+      models[name] = _select_model_file(name, files)
 
   _MODEL_SCAN_CACHE[cache_key] = models
   return models
@@ -183,6 +226,11 @@ class PresetConfig:
     else:
       self.tolerance = None
 
+    self.renderers = data.get('renderers')
+    if self.renderers is not None:
+      assert _is_list_of_strings(self.renderers), \
+        f"Preset '{self.name}' renderers must be a list of strings"
+
     # Strict schema: reject legacy flat fields
     assert 'rendering' not in data, f"Preset '{self.name}' defines legacy root-level 'rendering'; use 'gltf_test'"
     assert 'models' not in data, f"Preset '{self.name}' defines legacy root-level 'models'; use 'gltf_test'"
@@ -207,8 +255,9 @@ class TestConfig:
       assert _is_string(description), "description must be a string"
     self.description = description
 
-    self.renderers = data.get('renderers', default_renderers)
-    assert _is_list_of_strings(self.renderers), f"Test '{self.name}' renderers must be a list of strings"
+    test_renderers = data.get('renderers')
+    if test_renderers is not None:
+      assert _is_list_of_strings(test_renderers), f"Test '{self.name}' renderers must be a list of strings"
 
     self.apply_presets = data.get('apply_presets', [])
     assert _is_list_of_strings(self.apply_presets), f"Test '{self.name}' apply_presets must be a list of strings"
@@ -241,13 +290,17 @@ class TestConfig:
 
     # Note that this needs to applied in order.  Models will be overwritten.
     # Properties will be "added" in order.
-    # Tolerance is inherited from the LAST preset that has one defined
+    # Tolerance and renderers are inherited from the LAST preset that defines them.
+    preset_renderers = None
     for preset_name in self.apply_presets:
       assert preset_name in preset_dict, f"Used preset '{preset_name}' which is not defined in presets"
       preset = preset_dict[preset_name]
 
       if preset.tolerance:
         preset_tolerance = preset.tolerance
+
+      if preset.renderers is not None:
+        preset_renderers = preset.renderers
 
       if self.is_gltf_test:
         assert preset.sample_data is None, \
@@ -282,6 +335,14 @@ class TestConfig:
       self.tolerance = tolerance
     else:
       self.tolerance = preset_tolerance
+
+    # Resolve renderers (test > last preset > root default)
+    if test_renderers is not None:
+      self.renderers = test_renderers
+    elif preset_renderers is not None:
+      self.renderers = preset_renderers
+    else:
+      self.renderers = default_renderers
 
     # 3. Instantiate specific test config
     if self.is_gltf_test:

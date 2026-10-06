@@ -402,6 +402,7 @@ private:
     void importTextureCommon(OpenGLState& gl, Handle<HwTexture> th, intptr_t id, SamplerType target, uint8_t levels,
             TextureFormat format, uint8_t samples, uint32_t width, uint32_t height, uint32_t depth,
             TextureUsage usage, utils::ImmutableCString&& tag);
+    void createBufferObjectName(Handle<HwBufferObject> boh, BufferObjectBinding bindingType);
     void createBufferObjectCommon(OpenGLState& gl, Handle<HwBufferObject> boh, uint32_t byteCount,
             BufferObjectBinding bindingType, BufferUsage usage, utils::ImmutableCString&& tag);
     void setVertexBufferObjectCommon(Handle<HwVertexBuffer> vbh, uint32_t index,
@@ -465,7 +466,10 @@ private:
 #ifndef FILAMENT_SILENCE_NOT_SUPPORTED_BY_ES2
     // tasks executed on the main thread after the fence signaled
     void whenGpuCommandsComplete(const std::function<void()>& fn);
-    void executeGpuCommandsCompleteOps() noexcept;
+    // When afterFinish is true, the caller has just issued glFinish(), so every fence is known to
+    // have signaled even if the context does not report it yet (WebGL only updates sync status
+    // between browser tasks), and all pending ops are executed.
+    void executeGpuCommandsCompleteOps(bool afterFinish = false) noexcept;
     std::vector<std::pair<GLsync, std::function<void()>>> mGpuCommandCompleteOps;
 
     void whenFrameComplete(const std::function<void()>& fn);
